@@ -1795,6 +1795,118 @@ getinfo_helper_dir(control_connection_t *control_conn,
   return 0;
 }
 
+/** Allocate and return a smartlist of (constant and/or statically
+ * allocated) strings describing each isolation flag set in
+ * <b>isolation_flags</b>. */
+static smartlist_t *
+list_isolation_flags(uint8_t isolation_flags)
+{
+  smartlist_t *isoflaglist = smartlist_new();
+
+#define HANDLE_ISOFLAG(flagname) \
+  if (isolation_flags & ISO_##flagname)           \
+    smartlist_add(isoflaglist, (void *) #flagname)
+
+  HANDLE_ISOFLAG(DESTPORT);
+  HANDLE_ISOFLAG(DESTADDR);
+  HANDLE_ISOFLAG(SOCKSAUTH);
+  HANDLE_ISOFLAG(CLIENTPROTO);
+  HANDLE_ISOFLAG(CLIENTADDR);
+  HANDLE_ISOFLAG(SESSIONGRP);
+  HANDLE_ISOFLAG(NYM_EPOCH);
+  HANDLE_ISOFLAG(STREAM);
+
+#undef HANDLE_ISOFLAG
+
+  return isoflaglist;
+}
+
+/** If <b>session_group</b> is a special SESSION_GROUP_* constant,
+ * return a constant string describing it; otherwise, return NULL. */
+static const char *
+describe_special_session_group(int session_group)
+{
+  if (session_group < 0) {
+#define HANDLE_SPECIAL_SESSION_GROUP(sgrpname)                  \
+    if (session_group == SESSION_GROUP_##sgrpname)              \
+      return #sgrpname
+
+    HANDLE_SPECIAL_SESSION_GROUP(UNSET);
+    HANDLE_SPECIAL_SESSION_GROUP(DIRCONN);
+    HANDLE_SPECIAL_SESSION_GROUP(CONTROL_RESOLVE);
+    HANDLE_SPECIAL_SESSION_GROUP(FIRST_AUTO);
+
+#undef HANDLE_SPECIAL_SESSION_GROUP
+  }
+
+  return NULL;
+}
+
+/** Return a statically allocated or constant string describing
+ * <b>session_group</b>. */
+static const char *
+describe_session_group(int session_group)
+{
+  static char numeric_session_group_buf[64];
+  const char *special_session_group =
+    describe_special_session_group(session_group);
+  int rv;
+
+  if (special_session_group != NULL)
+    return special_session_group;
+
+  rv = tor_snprintf(numeric_session_group_buf,
+                    sizeof numeric_session_group_buf,
+                    "%d", session_group);
+  if (rv < 0) {
+    /* This can't happen. */
+    log_err(LD_BUG, "internal error");
+    tor_assert(0);
+  }
+
+  return numeric_session_group_buf;
+}
+
+/** Return a statically allocated or constant string describing
+ * <b>conn_type</b>. */
+static const char *
+describe_connection_type(uint8_t conn_type)
+{
+  static char unknown_conn_type_buf[64];
+  int rv;
+
+#define HANDLE_CONN_TYPE(conntype)           \
+  if (conn_type == CONN_TYPE_##conntype)     \
+    return #conntype
+
+  HANDLE_CONN_TYPE(OR_LISTENER);
+  HANDLE_CONN_TYPE(OR);
+  HANDLE_CONN_TYPE(EXIT);
+  HANDLE_CONN_TYPE(AP_LISTENER);
+  HANDLE_CONN_TYPE(AP);
+  HANDLE_CONN_TYPE(DIR_LISTENER);
+  HANDLE_CONN_TYPE(DIR);
+  HANDLE_CONN_TYPE(CPUWORKER);
+  HANDLE_CONN_TYPE(CONTROL_LISTENER);
+  HANDLE_CONN_TYPE(CONTROL);
+  HANDLE_CONN_TYPE(AP_TRANS_LISTENER);
+  HANDLE_CONN_TYPE(AP_NATD_LISTENER);
+  HANDLE_CONN_TYPE(AP_DNS_LISTENER);
+
+#undef HANDLE_CONN_TYPE
+
+  rv = tor_snprintf(unknown_conn_type_buf,
+                    sizeof unknown_conn_type_buf,
+                    "UNKNOWN_%d", (int)conn_type);
+  if (rv < 0) {
+    /* This can't happen. */
+    log_err(LD_BUG, "internal error");
+    tor_assert(0);
+  }
+
+  return unknown_conn_type_buf;
+}
+
 /** Allocate and return a description of <b>circ</b>'s current status,
  * including its path (if any). */
 static char *
@@ -3648,6 +3760,81 @@ write_stream_target_to_buf(entry_connection_t *conn, char *buf, size_t len)
   return 0;
 }
 
+
+/** Allocate and return a description of <b>conn</b>'s current isolation
+ *  state, including a list of isolation flags and the value of
+ *  each isolation parameter. */
+static char*
+describe_isolation_state(entry_connection_t *conn) {
+  smartlist_t *isoparts = smartlist_new();
+  smartlist_add(isoparts, tor_strdup("")); // Produces a leading space.
+
+  {
+    smartlist_t *isoflaglist = list_isolation_flags(conn->isolation_flags);
+    char *isoflaglist_joined;
+
+    if (smartlist_len(isoflaglist)) {
+      isoflaglist_joined = smartlist_join_strings(isoflaglist, ",", 0, NULL);
+      smartlist_add_asprintf(isoparts, "ISO_FLAGS=%s", isoflaglist_joined);
+      tor_free(isoflaglist_joined);
+    }
+
+    smartlist_free(isoflaglist);
+  }
+
+  smartlist_add_asprintf(isoparts, "SESSION_GROUP=%s",
+			 describe_session_group(conn->session_group));
+
+  smartlist_add_asprintf(isoparts, "NYM_EPOCH=%u", conn->nym_epoch);
+
+  if (conn->original_dest_address != NULL) {
+    smartlist_add_asprintf(isoparts, "ORIGINAL_DEST_ADDRESS=%s",
+			   conn->original_dest_address);
+  }
+
+  smartlist_add_asprintf(isoparts,  "CLIENT_ADDR=%s",
+			 fmt_addr(&(ENTRY_TO_CONN(conn)->addr)));
+
+  smartlist_add_asprintf(isoparts, "CLIENT_PROTO_TYPE=%s",
+			 describe_connection_type(conn->socks_request->listener_type));
+
+  if (conn->socks_request != NULL &&
+      conn->socks_request->socks_version != 0) {
+    smartlist_add_asprintf(isoparts, "CLIENT_PROTO_SOCKSVER=%d",
+			   conn->socks_request->socks_version);
+  }
+
+  if (conn->socks_request &&
+      conn->socks_request->socks_version == 4) {
+    smartlist_add_asprintf(isoparts, "CLIENT_AUTH=%.*s",
+			   (int) conn->socks_request->usernamelen,
+			   conn->socks_request->username);
+  } else if (conn->socks_request &&
+	     conn->socks_request->socks_version == 5 &&
+	     conn->socks_request->auth_type == 2) {
+    char client_username_hex[512];
+    char client_password_hex[512];
+    base16_encode(client_username_hex, sizeof(client_username_hex),
+		  conn->socks_request->username,
+		  conn->socks_request->usernamelen);
+    base16_encode(client_password_hex, sizeof(client_password_hex),
+		  conn->socks_request->password,
+		  conn->socks_request->passwordlen);
+    smartlist_add_asprintf(isoparts, "CLIENT_USERNAME_HEX=%s",
+			   client_username_hex);
+    smartlist_add_asprintf(isoparts, "CLIENT_PASSWORD_HEX=%s",
+			   client_password_hex);
+  }
+
+  char *isolation_state = smartlist_len(isoparts) ?
+    smartlist_join_strings(isoparts, " ", 0, NULL) :
+    tor_strdup("");
+
+  SMARTLIST_FOREACH(isoparts, char *, cp, tor_free(cp));
+  smartlist_free(isoparts);
+  return isolation_state;
+}
+
 /** Something has happened to the stream associated with AP connection
  * <b>conn</b>: tell any interested control connections. */
 int
@@ -3756,18 +3943,22 @@ control_event_stream_status(entry_connection_t *conn, stream_status_event_t tp,
       purpose = " PURPOSE=USER";
   }
 
+  char *isolation_state = describe_isolation_state(conn);
+
   circ = circuit_get_by_edge_conn(ENTRY_TO_EDGE_CONN(conn));
   if (circ && CIRCUIT_IS_ORIGIN(circ))
     origin_circ = TO_ORIGIN_CIRCUIT(circ);
   send_control_event(EVENT_STREAM_STATUS, ALL_FORMATS,
-                        "650 STREAM "U64_FORMAT" %s %lu %s%s%s%s\r\n",
+                        "650 STREAM "U64_FORMAT" %s %lu %s%s%s%s%s\r\n",
                      U64_PRINTF_ARG(ENTRY_TO_CONN(conn)->global_identifier),
                      status,
                         origin_circ?
                            (unsigned long)origin_circ->global_identifier : 0ul,
-                        buf, reason_buf, addrport_buf, purpose);
+                        buf, reason_buf, addrport_buf, purpose, isolation_state);
 
   /* XXX need to specify its intended exit, etc? */
+
+  tor_free(isolation_state);
 
   return 0;
 }
